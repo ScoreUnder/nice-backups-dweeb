@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+import os
+import hashlib
+import posixpath
+import struct
+import sys
+
+inf = sys.stdin.buffer
+out = sys.stdout.buffer
+
+extract = '-e' in sys.argv[1:]
+
+def from_cstring(s):
+    if (pos := s.find(b'\0')) != -1:
+        s = s[:pos]
+    s = s.decode('utf-8', errors='replace')
+    return s
+
+TWSTREAMHDR = "twstreamheader"
+TWIMG = "twimage"
+TWDATA = "twdatablock"
+TWFN = "twfilename"
+MD5TRAILER = "md5trailer"
+TWENDADB = "twendadb"
+
+header_size = 0x200
+
+errors = False
+got_end = False
+index = 0
+expecting = {TWSTREAMHDR}
+
+hasher = None
+reading_data = False
+remaining_bytes = 0
+
+if extract:
+    os.mkdir("extracted")
+    os.chdir("extracted")
+
+out_file = None
+
+while (buf := inf.read(header_size)) != b'':
+    if buf[:8] == b'TWRP\x00\x00\x00\x00':
+        if remaining_bytes < 0 and not reading_data:
+            remaining_bytes = 0
+        reading_data = False
+        command = from_cstring(buf[0x8:0x18])
+
+        if command not in expecting:
+            print(f"Got command {command} out-of-order!", file=sys.stderr)
+            errors = True
+
+        if command == TWSTREAMHDR:
+            expecting = {TWIMG, TWFN, TWENDADB}
+        elif command == TWIMG or command == TWFN:
+            if remaining_bytes > 0:
+                print(f"Oh no! new data came {hex(remaining_bytes)} bytes too soon!", file=sys.stderr)
+                errors = True
+            size, compressed, crc, name = struct.unpack_from("<QQI468s", buf, 0x18)
+            remaining_bytes = size
+            name = from_cstring(name)
+            if command == TWIMG:
+                cmdtype = "Image:"
+            else:
+                cmdtype = "Archive:"
+            index += 1
+            print(f"{index:2d} {cmdtype:<9s} {size:#012x} {name}")
+            hasher = hashlib.md5()
+            if extract:
+                out_file = open(posixpath.basename(name), "wb")
+
+            expecting = {TWDATA, MD5TRAILER}
+        elif command == TWDATA:
+            reading_data = True
+            expecting = {TWDATA, MD5TRAILER}
+        elif command == MD5TRAILER:
+            if out_file is not None:
+                out_file.close()
+                out_file = None
+
+            crc, ident, md5 = struct.unpack_from("<II40s", buf, 0x18)
+            md5 = from_cstring(md5)
+            if not hasher:
+                print(f"Got mismatched md5 trailer for file #{index}!", file=sys.stderr)
+                errors = True
+            elif (digest := hasher.hexdigest()) != md5:
+                print(f"MD5 hash does not match for file #{index}! expd: {md5}, got: {digest}", file=sys.stderr)
+                errors = True
+
+            hasher = None
+            expecting = {TWIMG, TWFN, TWENDADB}
+        elif command == TWENDADB:
+            got_end = True
+            expecting = {}
+        else:
+            print(f"Unknown command '{command}'", file=sys.stderr)
+            errors = True
+            expecting = {}
+    else:
+        if reading_data:
+            if hasher is not None:
+                hasher.update(buf)
+            if out_file is not None:
+                out_file.write(buf)
+            remaining_bytes -= header_size
+        else:
+            raise Exception(f"{hex(remaining_bytes)=} {hex(inf.tell())=}")
+
+if reading_data:
+    print("Got EOF before packed file was complete", file=sys.stderr)
+    errors = True
+elif not got_end:
+    print("Got EOF before all files were detected", file=sys.stderr)
+    errors = True
+
+if errors:
+    print("This backup is NOT SOUND! Do not use!", file=sys.stderr)
